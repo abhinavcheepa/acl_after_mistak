@@ -14,8 +14,6 @@ Architecture:
          ↓
     POS Tags
 
-Methods: zero_shot, lookback, lbs, lbs_weighted
-
 Fixes applied:
     [FIX-A] OOM — frozen params skip in checkpoint (~115MB not 606MB)
     [FIX-B] CUDA OOM — BATCH_SIZE=4, ACCUM_STEPS=16, gradient_checkpointing
@@ -23,23 +21,34 @@ Fixes applied:
     [FIX-D] strict=False load — frozen params missing ok
     [FIX-E] lbs_weighted method added
     [FIX-F] 4-layer fusion + MLP architecture (matches inference_pipeline_linear.py)
+    [FIX-G] Deprecated torch.cuda.amp → torch.amp (GradScaler + autocast)
+    [FIX-H] autocast/GradScaler device-aware
+    [FIX-I] evaluate() — -100 labels correctly filtered (not attention_mask based)
+    [FIX-J] Early stopping with PATIENCE added
+    [FIX-K] Training curves auto-save (results/linear_training_curves_DATE.png)
 """
 
 import os
 import gc
+import math
 import json
 import time
 import random
 import argparse
 import numpy as np
 from tqdm import tqdm
+from datetime import datetime
 from collections import defaultdict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast          # [FIX-G] torch.amp not torch.cuda.amp
 from torch.utils.data import Dataset, DataLoader
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from transformers import AutoTokenizer, AutoModel
 
@@ -68,10 +77,11 @@ EPOCHS          = 30
 LR              = 2e-5
 WEIGHT_DECAY    = 1e-2
 WARMUP_RATIO    = 0.1
-FREEZE_LAYERS   = 8
+FREEZE_LAYERS   = 6          # 8 → 6: 2 extra layers train hongi
 EMA_DECAY       = 0.999
 DROPOUT         = 0.1
 SEED            = 42
+PATIENCE        = 7          # [FIX-J] early stopping
 
 # Architecture
 NUM_LAYERS_FUSE = 4
@@ -183,9 +193,6 @@ class MuRIL_MLP_Linear(nn.Module):
         )
 
         self._freeze_layers(freeze_layers)
-
-        # [FIX-B] gradient checkpointing
-        # self.bert.gradient_checkpointing_enable()
 
         self.num_layers_fuse = num_layers_fuse
         self.layer_weights = nn.Parameter(
@@ -366,12 +373,47 @@ def compute_accuracy(preds_flat, labels_flat):
 
 
 # ─────────────────────────────────────────────
-# TRAIN / EVAL LOOP
+# TRAINING CURVES PLOT                [FIX-K]
+# ─────────────────────────────────────────────
+def save_training_curves(history, save_dir):
+    date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    epochs = range(1, len(history["train_loss"]) + 1)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig.suptitle(f"Linear Training Curves — {date_str}", fontsize=12)
+
+    axes[0].plot(epochs, history["train_loss"], label="Train Loss")
+    axes[0].plot(epochs, history["val_loss"],   label="Val Loss")
+    axes[0].set_title("Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].legend()
+
+    axes[1].plot(epochs, history["val_f1"],  label="Val F1",  color="green")
+    axes[1].plot(epochs, history["test_f1"], label="Test F1", color="orange")
+    axes[1].set_title("F1 Score")
+    axes[1].set_xlabel("Epoch")
+    axes[1].legend()
+
+    axes[2].plot(epochs, history["lr"], label="LR", color="red")
+    axes[2].set_title("Learning Rate")
+    axes[2].set_xlabel("Epoch")
+    axes[2].legend()
+
+    plt.tight_layout()
+    out_path = os.path.join(save_dir, f"linear_training_curves_{date_str}.png")
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"  📊 Training curves saved: {out_path}")
+
+
+# ─────────────────────────────────────────────
+# EVALUATE                            [FIX-I]
 # ─────────────────────────────────────────────
 def evaluate(model, loader, device):
     model.eval()
-    total_loss = 0.0
-    all_preds, all_labels = [], []
+    total_loss  = 0.0
+    all_preds   = []
+    all_labels  = []
 
     with torch.no_grad():
         for batch in loader:
@@ -385,11 +427,14 @@ def evaluate(model, loader, device):
 
             total_loss += loss.item()
 
+            # [FIX-I] filter by label != -100, not attention_mask
             for i in range(labels.size(0)):
-                for t in range(labels.size(1)):
-                    if attention_mask[i][t]:
-                        all_preds.append(preds[i][t].item())
-                        all_labels.append(labels[i][t].item())
+                label_seq = labels[i].tolist()
+                pred_seq  = preds[i].tolist()
+                for t in range(len(label_seq)):
+                    if label_seq[t] != -100:
+                        all_preds.append(pred_seq[t])
+                        all_labels.append(label_seq[t])
 
     avg_loss = total_loss / len(loader)
     f1  = compute_f1(all_preds, all_labels)
@@ -397,6 +442,9 @@ def evaluate(model, loader, device):
     return avg_loss, f1, acc
 
 
+# ─────────────────────────────────────────────
+# TRAIN
+# ─────────────────────────────────────────────
 def train(resume=False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -418,9 +466,9 @@ def train(resume=False):
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=0, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE*2, shuffle=False,
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE * 2, shuffle=False,
                               num_workers=0, pin_memory=True)
-    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE*2, shuffle=False,
+    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE * 2, shuffle=False,
                               num_workers=0, pin_memory=True)
 
     print("Building model...")
@@ -446,7 +494,8 @@ def train(resume=False):
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
 
-    scaler = GradScaler()
+    # [FIX-G] device-aware GradScaler
+    scaler = GradScaler('cuda') if device.type == "cuda" else GradScaler()
     ema    = EMA(model)
 
     config = {
@@ -464,6 +513,7 @@ def train(resume=False):
 
     start_epoch = 0
     best_f1     = 0.0
+    no_improve  = 0                                  # [FIX-J]
 
     if resume and os.path.exists(RESUME_PATH):
         print(f"Resuming from {RESUME_PATH}")
@@ -475,6 +525,8 @@ def train(resume=False):
     eff_batch = BATCH_SIZE * ACCUM_STEPS
     print(f"Training: {EPOCHS} epochs, effective batch = {eff_batch}")
     print("-" * 60)
+
+    history = {"train_loss": [], "val_loss": [], "val_f1": [], "test_f1": [], "lr": []}
 
     for epoch in range(start_epoch, EPOCHS):
         t0 = time.time()
@@ -491,7 +543,8 @@ def train(resume=False):
             token_type_ids = batch["token_type_ids"].to(device)
             labels         = batch["labels"].to(device)
 
-            with autocast():
+            # [FIX-H] device-aware autocast
+            with autocast('cuda' if device.type == "cuda" else 'cpu'):
                 loss = model(input_ids, attention_mask, token_type_ids, labels)
                 loss = loss / ACCUM_STEPS
 
@@ -509,7 +562,6 @@ def train(resume=False):
                 optimizer.zero_grad()
                 ema.update(model)
 
-            # [FIX-C] actual LR
             cur_lr = optimizer.param_groups[0]["lr"]
             pbar.set_postfix(loss=f"{loss.item()*ACCUM_STEPS:.4f}", lr=f"{cur_lr:.2e}")
 
@@ -533,11 +585,24 @@ def train(resume=False):
             f"LR={cur_lr:.2e} | Time={elapsed:.1f}m ETA={eta:.1f}m"
         )
 
+        history["train_loss"].append(avg_train_loss)
+        history["val_loss"].append(val_loss)
+        history["val_f1"].append(val_f1)
+        history["test_f1"].append(test_f1)
+        history["lr"].append(cur_lr)
+
+        # [FIX-J] Early stopping
         if val_f1 > best_f1 + 1e-4:
-            best_f1 = val_f1
+            best_f1    = val_f1
+            no_improve = 0
             save_checkpoint(BEST_PATH, model, optimizer, scheduler, epoch,
                             best_f1, config, ema=ema, lightweight=False)
             print(f"  ✅ New best saved: F1={best_f1:.4f}")
+        else:
+            no_improve += 1
+            if no_improve >= PATIENCE:
+                print(f"  ⏹ Early stopping at epoch {epoch+1}")
+                break
 
         save_checkpoint(RESUME_PATH, model, optimizer, scheduler, epoch,
                         best_f1, config, ema=None, lightweight=True)
@@ -545,6 +610,8 @@ def train(resume=False):
     print("\n✅ Training complete.")
     print(f"   Best Val F1: {best_f1:.4f}")
     print(f"   Best checkpoint: {BEST_PATH}")
+
+    save_training_curves(history, RESULTS_DIR)          # [FIX-K]
 
 
 # ─────────────────────────────────────────────

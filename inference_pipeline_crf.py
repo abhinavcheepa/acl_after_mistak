@@ -40,7 +40,7 @@ class MuRIL_CRF(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(hidden, num_labels),
         )
-        self.crf          = CRF(num_labels, batch_first=True)
+        self.crf = CRF(num_labels)
 
     def forward(self, input_ids, attention_mask):
         out    = self.muril(input_ids=input_ids,
